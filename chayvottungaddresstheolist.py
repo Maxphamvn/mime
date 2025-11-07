@@ -22,6 +22,16 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, List
 from datetime import datetime, timezone
+import argparse
+import threading
+import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+
+# Initialize console for logging
+console = Console()
 
 # -------- CONFIG / defaults --------
 BASE_URL = "https://scavenger.prod.gd.midnighttge.io"
@@ -61,6 +71,9 @@ class Stats:
 
 stats = Stats()
 stop_event = threading.Event()
+# Ensure only one worker performs the initial challenge GET/save
+challenge_fetch_lock = threading.Lock()
+challenge_fetched = threading.Event()
 
 # Error logging
 class ErrorLogger:
@@ -115,6 +128,18 @@ def post_solution(base_url: str, address: str, challenge_id: str, nonce: str):
         error_msg = str(e)
         error_logger.log_error(address, challenge_id, nonce, error_msg)
         return None, {"error": error_msg}
+
+
+def log_nonce_to_file(nonce: str, challenge_id: str, address: str, filename: str = "nounce.txt"):
+    """Append found nonce, challenge_id and address to a logfile (CSV-style).
+    Format: timestamp,nonce,challenge_id,address\n
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    line = f"{timestamp},{nonce},{challenge_id},{address}\n"
+    # write to file in append mode
+    with open(filename, "a", encoding="utf-8") as f:
+        f.write(line)
+        f.flush()
 
 def build_preimage(nonce_hex: str, address: str, challenge: dict) -> str:
     """
@@ -191,6 +216,25 @@ def read_challenges_from_csv(csv_file: str):
         sys.exit(1)
     return challenges
 
+
+def safe_get_challenge(base_url: str):
+    """Safely GET the current challenge from the server.
+    Returns (status_code, data) where data is parsed JSON on success or text/error dict on failure.
+    """
+    url = f"{base_url.rstrip('/')}/challenge"
+    try:
+        print(f"[debug] safe_get_challenge: GET {url}")
+        r = requests.get(url, timeout=6)
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+        print(f"[debug] safe_get_challenge: {r.status_code} -> {str(data)[:200]}")
+        return r.status_code, data
+    except Exception as e:
+        print(f"[debug] safe_get_challenge: ERROR {e}")
+        return None, {"error": str(e)}
+
 # ----------------- worker -----------------
 class Worker:
     def __init__(self, id:int, host:str, port:int, base_url:str, address:str, challenge_getter, submit_on_find:bool):
@@ -249,9 +293,101 @@ class Worker:
             self.sock = None
             return None
 
+    def _save_challenge_to_csv(self, challenge):
+        """Save challenge info to getchallenge.csv if not already exists"""
+        csv_file = "getchallenge.csv"
+        
+        # Check if challenge_id already exists in CSV
+        challenge_id = challenge.get("challenge_id", "")
+        if not challenge_id:
+            return
+        
+        existing_ids = set()
+        file_exists = os.path.isfile(csv_file)
+        
+        print(f"[worker {self.id}] _save_challenge_to_csv: cwd={os.getcwd()} path={os.path.abspath(csv_file)} file_exists={file_exists}")
+        if file_exists:
+            try:
+                with open(csv_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        existing_ids.add((row.get("challenge_id") or "").strip())
+            except Exception as e:
+                print(f"[worker {self.id}] error reading CSV: {e} -- will attempt to append anyway")
+        
+        # If challenge_id already exists, skip
+        print(f"[worker {self.id}] _save_challenge_to_csv: challenge_id={challenge_id} existing_count={len(existing_ids)}")
+        if challenge_id in existing_ids:
+            print(f"[worker {self.id}] _save_challenge_to_csv: already present, skipping")
+            return
+        
+        # Prepare row data - theo format getchallenge.csv
+        row = {
+            "challenge_id": challenge_id,
+            "difficulty": challenge.get("difficulty", ""),
+            "no_pre_mine": challenge.get("no_pre_mine", ""),
+            "no_pre_mine_hour": challenge.get("no_pre_mine_hour", ""),
+            "latest_submission": challenge.get("latest_submission", "")
+        }
+        
+        # Write to CSV
+        try:
+            with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+                fieldnames = ["challenge_id", "difficulty", "no_pre_mine", "no_pre_mine_hour", "latest_submission"]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                
+                # Write header if file is new
+                if not file_exists or os.path.getsize(csv_file) == 0:
+                    writer.writeheader()
+                
+                writer.writerow(row)
+            print(f"[worker {self.id}] saved challenge {challenge_id} to CSV")
+        except Exception as e:
+            print(f"[worker {self.id}] error writing to CSV: {e}")
+
+    def _fetch_and_save_challenge(self):
+        """Fetch challenge from API and save to CSV"""
+        # Only one worker should fetch/save the challenge to avoid duplicate API calls
+        if challenge_fetched.is_set():
+            # already fetched by another worker
+            return
+
+        with challenge_fetch_lock:
+            if challenge_fetched.is_set():
+                return
+            try:
+                print(f"[worker {self.id}] _fetch_and_save_challenge: calling safe_get_challenge({self.base_url})")
+                sc, data = safe_get_challenge(self.base_url)
+                print(f"[worker {self.id}] _fetch_and_save_challenge: got status={sc} data_type={type(data)}")
+                # API may return {"code":..., "challenge": { ... }} or the challenge dict directly
+                challenge_obj = None
+                if sc == 200 and isinstance(data, dict):
+                    if 'challenge' in data and isinstance(data['challenge'], dict):
+                        challenge_obj = data['challenge']
+                    elif 'challenge_id' in data:
+                        challenge_obj = data
+                    else:
+                        # maybe nested differently; log and skip
+                        print(f"[worker {self.id}] _fetch_and_save_challenge: unexpected payload keys: {list(data.keys())}")
+
+                if challenge_obj:
+                    print(f"[worker {self.id}] _fetch_and_save_challenge: extracted challenge_id={challenge_obj.get('challenge_id')}")
+                    self._save_challenge_to_csv(challenge_obj)
+                else:
+                    print(f"[worker {self.id}] _fetch_and_save_challenge: no valid challenge object to save ({sc})")
+            except Exception as e:
+                print(f"[worker {self.id}] _fetch_and_save_challenge: EXCEPTION {e}")
+            finally:
+                # mark fetched (even on error) to avoid repeated attempts by all workers
+                challenge_fetched.set()
+
     def run(self):
         # main loop: keep trying with current challenge until stop_event or new challenge
         print(f"[worker {self.id}] started")
+        
+        # Fetch and save challenge when worker starts
+        self._fetch_and_save_challenge()
+        
         while not stop_event.is_set():
             challenge = self.challenge_getter()
             if challenge is None:
@@ -334,10 +470,9 @@ class Worker:
                     time.sleep(0.5)
                     break  # re-fetch challenge since server may rotate difficulty
 
-                    # small yield
-                    time.sleep(0.001)
-                    print(f"[worker {self.id}] stopping")
-
+            # small yield
+            time.sleep(0.001)
+        print(f"[worker {self.id}] stopping")
 
 # --------------- orchestrator ---------------
 class Orchestrator:
@@ -360,6 +495,10 @@ class Orchestrator:
     def set_challenge(self, challenge):
         """Set current challenge for workers"""
         with self.challenge_lock:
+            # Debug: Print the challenge being set
+            print(f"[debug] Setting challenge: {challenge}")
+            if isinstance(challenge, dict):
+                print(f"[debug] Challenge keys: {list(challenge.keys())}")
             self.current_challenge = challenge
 
     def start_workers(self):
@@ -385,8 +524,17 @@ class Orchestrator:
             print(f"[{timestamp}] [orchestrator] No challenge set")
             return
         
-        print(f"[{timestamp}] [orchestrator] Starting with challenge: id={ch['challenge_id']} "
-              f"difficulty={ch['difficulty']} expires={ch.get('latest_submission', 'N/A')}")
+        # Debug: Print the challenge object structure
+        print(f"[debug] Challenge object keys: {list(ch.keys())}")
+        print(f"[debug] Challenge object: {ch}")
+        
+        # Safely get values with fallbacks
+        challenge_id = ch.get('challenge_id', 'unknown')
+        difficulty = ch.get('difficulty', 'unknown')
+        expires = ch.get('latest_submission', 'N/A')
+        
+        print(f"[{timestamp}] [orchestrator] Starting with challenge: id={challenge_id} "
+              f"difficulty={difficulty} expires={expires}")
         
         # Start workers
         self.start_workers()
@@ -423,49 +571,189 @@ def parse_args():
     p.add_argument("--base-url", default=BASE_URL, help="Scavenger API base URL")
     p.add_argument("--daemon-host", default=DAEMON_HOST, help="Local ashmaize daemon host")
     p.add_argument("--daemon-port", default=DAEMON_PORT, type=int, help="Local ashmaize daemon port")
-    p.add_argument("--workers", default=8, type=int, help="Number of worker threads (default: 8)")
+    p.add_argument("--workers", default=64, type=int, help="Number of worker threads (default: 8)")
     p.add_argument("--submit", action="store_true", default=True, help="Submit found solutions to server (default: True)")
-    p.add_argument("--csv-file", default=r"D:\midnight\a1.csv", help="CSV file containing challenges (default: D:\\midnight\\a1.csv)")
+    # Default to the workspace CSV if present (was a Windows path). Use a relative path so the
+    # script works inside this container/workspace.
+    p.add_argument("--csv-file", default="./getchallenge.csv", help="CSV file containing challenges (default: ./getchallenge.csv)")
     return p.parse_args()
+
+# ---------------- CSV Reader ----------------
+def read_challenges_from_csv(file_path, console):
+    import csv
+    challenges = []
+    try:
+        with open(file_path, newline="", encoding="utf-8") as csvfile:
+            # Read the first line to check if it's a header
+            first_line = csvfile.readline()
+            csvfile.seek(0)  # Reset file pointer to beginning
+            
+            if 'challenge_id' not in first_line:
+                # If no header, add the header row
+                reader = csv.DictReader(csvfile, fieldnames=[
+                    'challenge_id', 'difficulty', 'no_pre_mine', 
+                    'no_pre_mine_hour', 'latest_submission'
+                ])
+            else:
+                # If header exists, use it
+                reader = csv.DictReader(csvfile)
+            
+            for row in reader:
+                # Clean up keys by removing BOM and extra quotes/whitespace
+                cleaned_row = {}
+                for k, v in row.items():
+                    # Remove BOM and extra quotes/whitespace from keys
+                    clean_key = k.strip('"\'\ufeff ')
+                    cleaned_row[clean_key] = v
+                challenges.append(cleaned_row)
+                
+            console.log(f"[green]Successfully loaded {len(challenges)} challenges from CSV")
+            if challenges:
+                console.log(f"[dim]First challenge: {challenges[0]}")
+                
+    except Exception as e:
+        console.log(f"[red][ERROR] Failed to read CSV: {e}")
+        raise  # Re-raise the exception to stop execution
+        
+    if not challenges:
+        raise ValueError("No challenges found in the CSV file")
+        
+    return challenges
+
+def remove_challenge_from_csv(file_path: str, challenge_id: str, console: Optional[Console] = None) -> bool:
+    """Remove rows with given challenge_id from CSV file.
+
+    Returns True if at least one row was removed, False otherwise.
+    The CSV will be rewritten with a header of expected columns.
+    """
+    fieldnames = ['challenge_id', 'difficulty', 'no_pre_mine', 'no_pre_mine_hour', 'latest_submission']
+    try:
+        # Read existing rows
+        with open(file_path, newline='', encoding='utf-8') as csvfile:
+            first_line = csvfile.readline()
+            csvfile.seek(0)
+            if 'challenge_id' not in first_line:
+                reader = csv.DictReader(csvfile, fieldnames=fieldnames)
+            else:
+                reader = csv.DictReader(csvfile)
+            rows = list(reader)
+
+        # Filter rows
+        filtered = [r for r in rows if (r.get('challenge_id') or '').strip() != challenge_id]
+        removed = len(rows) - len(filtered)
+
+        # Write back (always include header)
+        tmp_path = f"{file_path}.tmp"
+        with open(tmp_path, 'w', newline='', encoding='utf-8') as outcsv:
+            writer = csv.DictWriter(outcsv, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in filtered:
+                # Ensure all keys exist
+                row = {k: (r.get(k) if r.get(k) is not None else '') for k in fieldnames}
+                writer.writerow(row)
+
+        # Atomic replace
+        os.replace(tmp_path, file_path)
+        if console:
+            console.log(f"[green]Removed {removed} rows with challenge_id={challenge_id} from {file_path}")
+        return removed > 0
+    except FileNotFoundError:
+        if console:
+            console.log(f"[red]CSV file not found: {file_path}")
+        return False
+    except Exception as e:
+        if console:
+            console.log(f"[red]Failed to remove challenge from CSV: {e}")
+        return False
+
 
 # --------------- main ---------------
 def main():
+    # Initialize console
+    console = Console()
+    
     args = parse_args()
     
-    # Register cleanup handler for saving error logs
+    # ✅ List address bạn cung cấp
+    address_list = [
+    "addr1q9fhk5c40yndvu980g86nhqfyp6nnfezwzuj4qa7p7cjytysszyvma8p94zc850du9xfnvwq0tw5luq4k7gn3g5jalss3rcwq3",
+    "addr1qy3758ga98ccaztylrnue8ej63ynskmgurrljaddsjq5tpwe7dncxgt6cnppgkjn2x3r48s26tu2nwphygep9fzm3kusyayuqf",
+    "addr1qy3csmd20n5v6ncc779jerzfqsvxw9xly3vmjfr8spx0npkxthj9g2s0cgecdpsjlr55vtdjmm2squk69p95cklncv2qeu0cm0",
+    "addr1qy7eycs367w56qk7qtjzwtejjaz4nzd5ah6gqd5svq5vn88gwa4rem8mqeqlrtudkyj23hg4gzncm2dp5rqrlx9sjzvqguw4fa",
+    "addr1qypkwzcq24y2ma0w7l8v0vv6524nv2fh8raulqchq6suj7f6lj02e8ehjdf3ed8npdv72yk8ppp7l8757sfq9zyn48kscyusqu",
+    "addr1qywhtq522evxxjx7h6h5xxqhvz8wvtu0tytmfzlt8gzy0rathsfku293m6p7d00yat90qng90qp8qadwrtes7zvwq36qf6nxp7",
+   
+     ]
+
+    # Register cleanup
     import atexit
-    atexit.register(lambda: error_logger.save_errors_to_file(args.address))
-    
-    # Read challenges from CSV
-    challenges = read_challenges_from_csv(args.csv_file)
-    
-    if not challenges:
-        print("No challenges found in CSV file")
+    atexit.register(lambda: error_logger.save_errors_to_file("MULTIADDR"))
+
+    try:
+        challenges = read_challenges_from_csv(args.csv_file, console)
+        if not challenges:
+            console.log("[red]No challenges found in CSV")
+            return
+            
+        # Debug: Print the first challenge to see its structure
+        if challenges:
+            console.log(f"[yellow]First challenge in list: {challenges[0]}")
+            console.log(f"[yellow]Challenge keys: {list(challenges[0].keys())}")
+    except Exception as e:
+        console.log(f"[red]Error loading challenges: {e}")
         return
 
-    print(f"Starting miner for address {args.address}")
-    print(f"Processing {len(challenges)} challenges from CSV")
+    print(f"✅ TOTAL challenges: {len(challenges)}")
+    print(f"✅ TOTAL addresses: {len(address_list)}")
 
-    # iterate challenges sequentially
-    for idx, challenge in enumerate(challenges, start=1):
-        print(f"\n{'='*60}")
-        print(f"Processing challenge {idx}/{len(challenges)}: {challenge['challenge_id']}")
-        print(f"{'='*60}")
+    # ---------------- Progress Loop ----------------
+    with Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+
+        challenge_task = progress.add_task("Processing Challenges", total=len(challenges))
         
-        # reset global stop and stats for each challenge
-        stop_event.clear()
-        stats.reset()
+        for c_idx, challenge in enumerate(challenges, start=1):
+            progress.update(challenge_task, description=f"Challenge {c_idx}/{len(challenges)}")
+            # Debug: Print the challenge object to see its structure
+            print(f"\nDebug - challenge object: {challenge}")
+            # Safely get challenge_id or use a default value
+            challenge_id = challenge.get('challenge_id', f'unknown_{c_idx}')
+            console.log(f"\n[bold green]Starting Challenge {c_idx}: {challenge_id}")
 
-        orch = Orchestrator(args.base_url, args.address, args.daemon_host, args.daemon_port, args.workers, args.submit)
-        orch.set_challenge(challenge)
-        orch.run(stats_interval=10.0)  # will return when stop_event set (on successful submit) or on error/interrupt
+            addr_task = progress.add_task("Processing Addresses", total=len(address_list))
+            for a_idx, addr in enumerate(address_list, start=1):
+                progress.update(addr_task, description=f"Addr {a_idx}/{len(address_list)}")
+                stop_event.clear()
+                stats.reset()
 
-        print(f"Finished challenge {challenge['challenge_id']}. Sleeping 1s before next challenge.")
-        time.sleep(1)
+                orch = Orchestrator(
+                    args.base_url,
+                    addr,
+                    args.daemon_host,
+                    args.daemon_port,
+                    args.workers,
+                    args.submit
+                )
+                orch.set_challenge(challenge)
+                start_time = time.time()
+                orch.run(stats_interval=10.0)
+                elapsed = time.time() - start_time
 
-    print(f"\n{'='*60}")
-    print(f"Completed all {len(challenges)} challenges!")
-    print(f"{'='*60}")
+                console.log(f"✅ Done mining for address {addr} in {elapsed:.1f}s")
+                progress.advance(addr_task)
+                time.sleep(1)
+
+            console.log(f"✅ Done Challenge {challenge['challenge_id']}")
+            progress.advance(challenge_task)
+            time.sleep(1)
+
+    console.log("\n✅✅ ALL COMPLETED ✅✅")
 
 if __name__ == "__main__":
     main()
