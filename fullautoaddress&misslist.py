@@ -676,12 +676,12 @@ def main():
     
     # ✅ List address bạn cung cấp
     address_list = [
-"addr1q9z8hfnatl55vreujm35q3knnxd4hrzy8yeu3tzvhjnh6x505glrcflcgwfcx9patcul4a5ejvgczdhpjtq2c6d0a0asrzzl0r",
-    "addr1q8hxeplaz0ksfcp6qdju3wxutxe43zjj7fq5uhfegjsq5nnzvqp3l4tlhc55sph9z725cpygj060qhuvvj8a68vkswgq09de72",
-    "addr1q8ejau40e0erjlepyvl30sndf8np6pqg6xzrjmyyfm03vnn23wflk4qmfkslvnwr8gxjjk7me3wf3lzgyetk25qm9f4svtdekh",
-    "addr1q9qux8uesw3ck8dfkd7xn6n68ddypsmn9tyc56v586qnqn6m7pwyw3vlxjx693lhuaeat8vx0guclnf7hjq7cfcf76xqf22llg",
-    "addr1qxy0td0rvuhm4ddvp2svr6mx9w7hhwge2t02s3flr8zq8e9lp8j9268wjj4rzddw8czwwpe3h3jqjppq7shp9l0yrgeqh5rd2e",
-    "addr1q8znuqf74ndn0n2rm6hqpejf7lzjy2cku8335axcy98g4r2r3nyevctvtajc9656w06wk5kucp4a4spl0sw3d6g7um4s38ymqr",
+    "addr1qxck97x06t8vr9ufd4ar2cgsul2h4nrfvt0qfa2rvftfn3knv8r0llmu3wl4s4yewtgjqlnvryn620cjquer2w0cr0dslczxmj",
+    "addr1q8f7ddqsxxnnwyl6w2jv57xjr2pd9vg7yf02lnmytgzwz4tw0yhexqllts6vkyzk34dwsle6tru83a6dcaaps6shy9hqm8whcx",
+    "addr1qyegr57af4gv5yr2c8mrutu35kr7vz6sh7sfns7spl4ym8dx776vhgnsp7m7ccyrf2wk034pqglguzp0l2z82fc66smsf6lfjq",
+    "addr1qyyj3kudu7syjy6ghhfutxp36nejzl4hal82xlftgav9xn4wrcak277yrclpm6ac95n9rvl0fdh06rh7gwq3vmps5ceq28maju",
+    "addr1qykl00m6vm64wa6e0f8trq8lvmx5dl0rdzmp3jx2phgz8ked03nr5ts5dss0rfxzkjtlalpx32t782rz49xqeu8mtvkqz7x9h3",
+    "addr1q8p2vhe998d6un40cfv84exnnd28r08gplpjr5jg7n7vrc4fj3zlkyd2ee48uk2r8nuqxssr30envwnu990sxvuhqfdqye9xxc",
      ]
 
     # Register cleanup

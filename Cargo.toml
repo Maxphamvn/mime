@@ -11,8 +11,9 @@ mimalloc = { version = "0.1", default-features = false }
 
 # Use ce-ashmaize crate from local path or git.
 # Option A: local path (if you cloned repo inside this workspace next to Cargo.toml)
-# Updated to point to the `ce-ashmaize` folder inside this repository.
-ashmaize = { path = "./ce-ashmaize" }
+# Updated to point to the `ce-ashmaize` crate nested inside the folder in this repository.
+# The crate lives at ce-ashmaize/ce-ashmaize/Cargo.toml so point to that path.
+ashmaize = { path = "./ce-ashmaize/ce-ashmaize" }
 
 # Option B: use git (if you prefer)
 # ce-ashmaize = { git = "https://github.com/input-output-hk/ce-ashmaize" }
